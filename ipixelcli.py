@@ -3,7 +3,7 @@ import asyncio
 import argparse
 import websockets
 from websockets.server import serve
-from bleak import BleakClient
+from bleak import BleakClient, BleakError
 from commands import *
 
 COMMANDS = {
@@ -15,56 +15,67 @@ COMMANDS = {
     "delete_screen": delete_screen,
     "send_text": send_text,
     "set_screen": set_screen,
-    "set_speed" : set_speed,
+    "set_speed": set_speed,
     "send_animation": send_animation,
     "set_orientation": set_orientation
 }
 
-# Socket server
-async def handle_websocket(websocket, path, address):
-    async with BleakClient(address) as client:
-        print("[INFO] Connected to the device")
+# Attempt to connect to the BLE device with retries
+async def connect_to_device(address, max_retries=5):
+    retries = 0
+    while retries < max_retries:
         try:
-            while True:
-                # Wait for a message from the client
-                message = await websocket.recv()
+            client = BleakClient(address)
+            await client.connect()
+            if client.is_connected:
+                print("[INFO] Connected to the device")
+                return client
+        except BleakError as e:
+            print(f"[ERROR] Connection failed ({retries + 1}/{max_retries}): {e}")
+            retries += 1
+            await asyncio.sleep(5)  # Wait before retrying
+    print("[ERROR] Could not connect to the device after multiple attempts")
+    return None
 
-                # Parse JSON
-                try:
-                    command_data = json.loads(message)
-                    command_name = command_data.get("command")
-                    params = command_data.get("params", [])
+async def handle_websocket(websocket, path, address):
+    client = await connect_to_device(address)
+    if not client:
+        return
 
-                    if command_name in COMMANDS:
-                        # Separate positional and keyword arguments
-                        positional_args = []
-                        keyword_args = {}
-                        for param in params:
-                            if "=" in param:
-                                key, value = param.split("=", 1)
-                                keyword_args[key.replace('-', '_')] = value
-                            else:
-                                positional_args.append(param)
+    try:
+        while True:
+            message = await websocket.recv()
+            try:
+                command_data = json.loads(message)
+                command_name = command_data.get("command")
+                params = command_data.get("params", [])
 
-                        # Generate the data to send
-                        data = COMMANDS[command_name](*positional_args, **keyword_args)
+                if command_name in COMMANDS:
+                    positional_args = []
+                    keyword_args = {}
+                    for param in params:
+                        if "=" in param:
+                            key, value = param.split("=", 1)
+                            keyword_args[key.replace('-', '_')] = value
+                        else:
+                            positional_args.append(param)
 
-                        # Send the data to the device
-                        await client.write_gatt_char(
-                            "0000fa02-0000-1000-8000-00805f9b34fb", data
-                        )
+                    data = COMMANDS[command_name](*positional_args, **keyword_args)
+                    await client.write_gatt_char("0000fa02-0000-1000-8000-00805f9b34fb", data)
+                    response = {"status": "success", "command": command_name}
+                else:
+                    response = {"status": "error", "message": "Unknown command"}
+            except Exception as e:
+                response = {"status": "error", "message": str(e)}
 
-                        # Prepare the response
-                        response = {"status": "success", "command": command_name}
-                    else:
-                        response = {"status": "error", "message": "Commande inconnue"}
-                except Exception as e:
-                    response = {"status": "error", "message": str(e)}
-
-                # Send the response to the client
-                await websocket.send(json.dumps(response))
-        except websockets.ConnectionClosed:
-            print("[INFO] Websocket connection has been closed")
+            await websocket.send(json.dumps(response))
+    except websockets.ConnectionClosed:
+        print("[INFO] Websocket connection closed")
+    except BleakError:
+        print("[ERROR] BLE connection lost, attempting to reconnect...")
+        await handle_websocket(websocket, path, address)  # Reconnect and restart
+    finally:
+        await client.disconnect()
 
 async def start_server(ip, port, address):
     server = await serve(lambda ws, path: handle_websocket(ws, path, address), ip, port)
@@ -72,10 +83,12 @@ async def start_server(ip, port, address):
     await server.wait_closed()
 
 async def execute_command(command_name, params, address):
-    async with BleakClient(address) as client:
-        print("[INFO] Connected to the device")
+    client = await connect_to_device(address)
+    if not client:
+        return
+
+    try:
         if command_name in COMMANDS:
-            # Separate positional and keyword arguments
             positional_args = []
             keyword_args = {}
             for param in params:
@@ -85,12 +98,13 @@ async def execute_command(command_name, params, address):
                 else:
                     positional_args.append(param)
 
-            # Call the command with both positional and keyword arguments
             data = COMMANDS[command_name](*positional_args, **keyword_args)
             await client.write_gatt_char("0000fa02-0000-1000-8000-00805f9b34fb", data)
             print(f"[INFO] Command '{command_name}' executed successfully.")
         else:
             print(f"[ERROR] Unknown command: {command_name}")
+    finally:
+        await client.disconnect()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WebSocket BLE Server")
